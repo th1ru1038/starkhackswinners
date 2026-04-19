@@ -1,7 +1,7 @@
 // gripper.ino — Smart Adaptive Gripper
 // Arduino Mega 2560
 // Streams CSV over Serial: ax,ay,az,distance,touch
-// Receives 'T' from Python to tighten grip 5 degrees
+// Receives 'T' to tighten, 'O' to open, 'G' to grip
 
 #include <Wire.h>
 #include <Servo.h>
@@ -113,13 +113,24 @@ void updateGripLogic(float distance, int touch) {
   }
 }
 
-// ── Handle 'T' command from Python to tighten ─────────────────
+// ── Handle serial commands from Python ───────────────────────
+// T — tighten (+5°, max SERVO_MAX)
+// O — open    (0°,  gripping = false)
+// G — grip    (90°, gripping = true)
 void checkSerialCommands() {
   while (Serial.available()) {
     char cmd = Serial.read();
     if (cmd == 'T') {
       servoAngle = min(servoAngle + TIGHTEN_DEGREES, SERVO_MAX);
       gripper.write(servoAngle);
+    } else if (cmd == 'O') {
+      servoAngle = SERVO_OPEN;
+      gripper.write(servoAngle);
+      gripping = false;
+    } else if (cmd == 'G') {
+      servoAngle = SERVO_GRIP;
+      gripper.write(servoAngle);
+      gripping = true;
     }
   }
 }
