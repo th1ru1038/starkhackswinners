@@ -1,9 +1,13 @@
 """
 slip_detection.py — Gripper slip detector
 
-Reads CSV from Arduino (ax,ay,az,distance,touch), maintains a 100 ms rolling
-window of ax values, and sends 'T' back to the Arduino when the std dev
-exceeds the slip threshold.
+Reads CSV from Arduino (ax,ay,az,distance), maintains a rolling window of ax
+values, and fires a slip event when the std dev exceeds the threshold.
+
+On slip:
+  - Logs the event immediately to CSV
+  - Speaks a voice alert via macOS `say`
+  - Updates in-memory state polled by dashboard.py
 
 Standalone usage:
     python slip_detection.py --port /dev/cu.usbmodemXXXX
@@ -15,37 +19,35 @@ Importable usage (used by dashboard.py):
     rows = detector.get_latest()   # list of dicts
 """
 
+import argparse
 import csv
 import math
 import os
 import time
 import threading
-import argparse
 from collections import deque
 
 import serial
 from dotenv import load_dotenv
 
-load_dotenv()  # reads GEMINI_API_KEY and ELEVENLABS_API_KEY from .env
+load_dotenv()
 
 def _log(msg: str):
-    """Timestamped print for tracing the slip pipeline."""
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # ── Tunable constants ─────────────────────────────────────────
 SERIAL_PORT      = "/dev/cu.usbmodem21201"
 SERIAL_BAUD      = 115200
-SLIP_WINDOW_MS   = 500    # rolling window length in milliseconds
-SLIP_THRESHOLD_G = 0.3   # std dev above this → slip event
+SLIP_WINDOW_MS   = 500   # rolling window length in milliseconds
+SLIP_THRESHOLD_G = 0.3   # ax std dev above this → slip event
 SLIP_COOLDOWN_S  = 2.0   # minimum seconds between slip events
-MAX_STORED_ROWS  = 200    # rows kept in memory for the dashboard
+MAX_STORED_ROWS  = 200   # rows kept in memory for the dashboard
 LOG_FILE         = "gripper_log.csv"
-ELEVENLABS_VOICE = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")  # Rachel
-CSV_HEADERS      = ["timestamp", "ax", "ay", "az", "distance", "touch", "slip"]
+CSV_HEADERS      = ["timestamp", "ax", "ay", "az", "distance", "slip"]
 
 
 class SlipDetector:
-    """Reads Arduino serial data, detects slip, commands tighten."""
+    """Reads Arduino serial data and detects grip slip via ax std dev."""
 
     def __init__(self, port: str, baud: int = SERIAL_BAUD):
         self.port = port
@@ -64,11 +66,10 @@ class SlipDetector:
         # Recent rows for the dashboard
         self._data: deque = deque(maxlen=MAX_STORED_ROWS)
 
-        # Latest slip analysis text (polled by dashboard)
+        # Latest slip alert text (polled by dashboard)
         self._latest_analysis: str = ""
 
-        # Servo angle tracker (starts at grip angle, +5° per slip, max 175°)
-        self._servo_angle: int = 90
+        # Slip counter
         self._slip_count: int = 0
 
         # Timestamp of last routine CSV write (throttled to 1 Hz)
@@ -84,28 +85,20 @@ class SlipDetector:
     # ── Public API ────────────────────────────────────────────
 
     def start(self):
-        """Open serial port and begin reading in a background thread."""
-        gemini_ok    = bool(os.getenv("GEMINI_API_KEY"))
-        elevenlabs_ok = bool(os.getenv("ELEVENLABS_API_KEY"))
-        _log(f"API keys — Gemini: {'OK' if gemini_ok else 'MISSING'} | "
-             f"ElevenLabs: {'OK' if elevenlabs_ok else 'MISSING'}")
         self.ser = serial.Serial(self.port, self.baud, timeout=1)
         _log(f"Serial open on {self.port} at {self.baud} baud — waiting for Arduino boot...")
         time.sleep(2)
         self._running = True
-        t = threading.Thread(target=self._read_loop, daemon=True)
-        t.start()
+        threading.Thread(target=self._read_loop, daemon=True).start()
         _log("Read loop started")
 
     def stop(self):
-        """Stop reading and close the serial port and log file."""
         self._running = False
         if self.ser and self.ser.is_open:
             self.ser.close()
         self._csv_file.close()
 
     def get_latest(self) -> list:
-        """Return a thread-safe copy of the most recent data rows."""
         with self._lock:
             return list(self._data)
 
@@ -113,23 +106,9 @@ class SlipDetector:
         with self._lock:
             return self._latest_analysis
 
-    def get_servo_angle(self) -> int:
-        with self._lock:
-            return self._servo_angle
-
     def get_slip_count(self) -> int:
         with self._lock:
             return self._slip_count
-
-    def send_command(self, cmd: str) -> None:
-        """Send a single-byte command to the Arduino over the shared serial port."""
-        with self._lock:
-            if cmd == 'O':
-                self._servo_angle = 0
-            elif cmd == 'G':
-                self._servo_angle = 90
-        self.ser.write(cmd.encode())
-        _log(f"Command sent: '{cmd}'")
 
     # ── Internal ──────────────────────────────────────────────
 
@@ -137,22 +116,19 @@ class SlipDetector:
         while self._running:
             try:
                 raw = self.ser.readline().decode("utf-8", errors="ignore").strip()
-                if not raw or raw.count(",") != 4:
-                    continue  # skip header lines or garbage
+                fields = raw.split(",") if raw else []
+                if len(fields) not in (4, 5):
+                    continue  # expect ax,ay,az,distance or ax,ay,az,distance,touch
 
-                parts = raw.split(",")
-                ax, ay, az, distance, touch = (float(p) for p in parts)
-                touch = int(touch)
-                now   = time.time()
-
+                ax, ay, az, distance = (float(f) for f in fields[:4])
+                touch = int(float(fields[4])) if len(fields) == 5 else 0
+                now  = time.time()
                 slip = self._check_slip(now, ax)
 
                 if slip:
-                    self.ser.write(b"T\n")  # tell Arduino to tighten
                     with self._lock:
-                        self._servo_angle = min(self._servo_angle + 5, 175)
                         self._slip_count += 1
-                    _log(f"SLIP DETECTED  ax_std={self._std():.3f}g  → tightening servo to {self._servo_angle}°")
+                    _log(f"SLIP DETECTED  ax_std={self._std():.3f}g")
 
                 row = {
                     "timestamp": now,
@@ -162,7 +138,7 @@ class SlipDetector:
                     "slip": slip,
                 }
 
-                # Log slip events immediately; normal rows throttled to 1 Hz
+                # Slip rows logged immediately; normal rows throttled to 1 Hz
                 if slip or (now - self._last_csv_time) >= 1.0:
                     self._csv_writer.writerow({k: row[k] for k in CSV_HEADERS})
                     self._csv_file.flush()
@@ -172,36 +148,30 @@ class SlipDetector:
                 with self._lock:
                     self._data.append(row)
 
-                # On slip: speak warning in background (non-blocking)
                 if slip:
                     ax_std = self._std()
                     _log(f"Starting speech thread (ax_std={ax_std:.3f}g)")
                     threading.Thread(
-                        target=self._analyze_slip,
+                        target=self._alert,
                         args=(ax_std,),
                         daemon=True,
                     ).start()
 
             except ValueError:
-                continue  # malformed CSV line
+                continue
             except serial.SerialException as e:
                 print(f"Serial error: {e}")
                 break
 
     def _check_slip(self, now: float, ax: float) -> bool:
-        """Add sample to rolling window, prune old entries, return slip flag."""
         cutoff = now - (SLIP_WINDOW_MS / 1000.0)
-
         self._window.append((now, ax))
-
-        # Drop samples that have aged out of the window
         while self._window and self._window[0][0] < cutoff:
             self._window.popleft()
 
         if len(self._window) < 3:
-            return False  # need at least 3 points for a meaningful std dev
+            return False
 
-        # Enforce cooldown — ignore slip if one fired recently
         if (now - self._last_slip_time) < SLIP_COOLDOWN_S:
             return False
 
@@ -212,32 +182,22 @@ class SlipDetector:
         return False
 
     def _std(self) -> float:
-        """Population standard deviation of ax values in the rolling window."""
         values = [v for _, v in self._window]
-        n      = len(values)
+        n = len(values)
         if n < 2:
             return 0.0
-        mean     = sum(values) / n
-        variance = sum((v - mean) ** 2 for v in values) / n
-        return math.sqrt(variance)
+        mean = sum(values) / n
+        return math.sqrt(sum((v - mean) ** 2 for v in values) / n)
 
-    # ── Speech pipeline (runs in background thread on slip) ──
-
-    def _analyze_slip(self, ax_std: float):
+    def _alert(self, ax_std: float):
         message = (
             f"Warning. Grip instability detected. "
-            f"Acceleration spike of {ax_std:.2f} g. "
-            f"Servo tightened."
+            f"Acceleration spike of {ax_std:.2f} g."
         )
         _log(f"Speaking: {message}")
         with self._lock:
             self._latest_analysis = message
-        self._speak(message)
-
-    def _speak(self, text: str):
-        _log(f"say: {text}")
-        os.system(f'say "{text}"')
-
+        os.system(f'say "{message}"')
 
 
 # ── Standalone entrypoint ─────────────────────────────────────
@@ -261,7 +221,7 @@ if __name__ == "__main__":
                 r = rows[-1]
                 print(
                     f"ax={r['ax']:+.3f}g  ay={r['ay']:+.3f}g  az={r['az']:+.3f}g  "
-                    f"dist={r['distance']:6.1f}cm  touch={r['touch']}  slip={r['slip']}"
+                    f"dist={r['distance']:6.1f}cm  slip={r['slip']}"
                 )
             time.sleep(0.1)
     except KeyboardInterrupt:

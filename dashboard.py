@@ -13,12 +13,14 @@ import threading
 import time
 from flask import Flask, jsonify, render_template_string, request
 from slip_detection import SlipDetector
+from gamepad_controller import GamepadController
 
 FLASK_HOST = "127.0.0.1"
 FLASK_PORT = 5000
 
 app = Flask(__name__)
-detector: SlipDetector = None
+detector:   SlipDetector     = None
+gamepad_ctrl: GamepadController = None
 
 _HTML = """
 <!DOCTYPE html>
@@ -236,14 +238,6 @@ _HTML = """
       font-family: var(--mono);
     }
 
-    /* Servo angle arc */
-    .servo-arc-wrap {
-      display: flex;
-      align-items: center;
-      gap: 14px;
-    }
-    .servo-arc-wrap svg { flex-shrink: 0; }
-
     /* ── Charts ── */
     .charts-row {
       display: grid;
@@ -328,6 +322,87 @@ _HTML = """
     .log-text { color: var(--text); }
     .log-empty { color: var(--text-dim); font-style: italic; font-size: 11px; font-family: var(--mono); }
 
+    /* ── Servo Panel ── */
+    .servo-panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .servo-panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .servo-panel-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-mid);
+      letter-spacing: 0.3px;
+    }
+    .servo-status-badge {
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.8px;
+      text-transform: uppercase;
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-family: var(--mono);
+    }
+    .servo-status-badge.ok   { color: var(--green); background: rgba(48,209,88,0.1); border: 1px solid rgba(48,209,88,0.25); }
+    .servo-status-badge.off  { color: var(--text-dim); background: var(--surface2); border: 1px solid var(--border); }
+    .servo-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+    }
+    .servo-item {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .servo-label {
+      font-size: 10px;
+      font-weight: 600;
+      color: var(--text-dim);
+      letter-spacing: 0.8px;
+      text-transform: uppercase;
+      font-family: var(--mono);
+    }
+    .servo-bar-wrap {
+      position: relative;
+      height: 6px;
+      background: var(--surface2);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .servo-bar-fill {
+      position: absolute;
+      top: 0; bottom: 0; left: 0;
+      background: var(--blue);
+      border-radius: 3px;
+      transition: width 0.12s ease;
+    }
+    .servo-val {
+      font-size: 11px;
+      font-family: var(--mono);
+      color: var(--blue);
+    }
+    .gamepad-badge {
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.8px;
+      text-transform: uppercase;
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-family: var(--mono);
+    }
+    .gamepad-badge.ok  { color: var(--cyan); background: rgba(0,200,255,0.1); border: 1px solid rgba(0,200,255,0.25); }
+    .gamepad-badge.off { color: var(--text-dim); background: var(--surface2); border: 1px solid var(--border); }
+
     /* ── Footer ── */
     .footer {
       display: flex;
@@ -361,7 +436,7 @@ _HTML = """
     <div class="banner-icon">⚠</div>
     <div class="banner-body">
       <div class="banner-title">Slip Detected</div>
-      <div class="banner-msg" id="banner-msg">Grip instability detected — servo tightening...</div>
+      <div class="banner-msg" id="banner-msg">Grip instability detected — acceleration spike recorded</div>
     </div>
     <div class="banner-timer" id="banner-timer">5s</div>
   </div>
@@ -374,26 +449,6 @@ _HTML = """
         <span class="stat-value" id="stat-slips">0</span>
       </div>
       <span class="stat-sub" id="stat-last-slip">No events yet</span>
-    </div>
-
-    <div class="stat-card cyan">
-      <span class="stat-label">Servo Angle</span>
-      <div class="servo-arc-wrap">
-        <svg id="servo-svg" width="56" height="56" viewBox="0 0 56 56">
-          <circle cx="28" cy="28" r="22" fill="none" stroke="#1e2235" stroke-width="5"/>
-          <circle id="servo-arc" cx="28" cy="28" r="22" fill="none"
-            stroke="#00c8ff" stroke-width="5"
-            stroke-dasharray="0 138.23"
-            stroke-dashoffset="34.56"
-            stroke-linecap="round"
-            transform="rotate(-220 28 28)"
-          />
-        </svg>
-        <div>
-          <span class="stat-value" id="stat-servo">90</span><span class="stat-unit">°</span>
-        </div>
-      </div>
-      <span class="stat-sub">Max 175°</span>
     </div>
 
     <div class="stat-card blue">
@@ -409,7 +464,7 @@ _HTML = """
       <div>
         <span class="stat-value" id="stat-dist">—</span><span class="stat-unit" id="stat-dist-unit"></span>
       </div>
-      <span class="stat-sub" id="stat-touch">Touch: —</span>
+      <span class="stat-sub" id="stat-touch"></span>
     </div>
   </div>
 
@@ -444,9 +499,45 @@ _HTML = """
     </div>
   </div>
 
+  <!-- Servo Control Panel -->
+  <div class="servo-panel">
+    <div class="servo-panel-header">
+      <span class="servo-panel-title">ARM SERVO POSITIONS</span>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span class="gamepad-badge off" id="gamepad-badge">GAMEPAD OFF</span>
+        <span class="servo-status-badge off" id="servo-badge">SERVO OFF</span>
+      </div>
+    </div>
+    <div class="servo-grid">
+      <div class="servo-item">
+        <span class="servo-label">Gripper (ID 1)</span>
+        <div class="servo-bar-wrap"><div class="servo-bar-fill" id="bar-gripper" style="width:50%"></div></div>
+        <span class="servo-val" id="val-gripper">2047</span>
+      </div>
+      <div class="servo-item">
+        <span class="servo-label">Wrist (ID 2)</span>
+        <div class="servo-bar-wrap"><div class="servo-bar-fill" id="bar-wrist" style="width:50%"></div></div>
+        <span class="servo-val" id="val-wrist">2047</span>
+      </div>
+      <div class="servo-item">
+        <span class="servo-label">Shoulder (ID 3)</span>
+        <div class="servo-bar-wrap"><div class="servo-bar-fill" id="bar-shoulder" style="width:50%"></div></div>
+        <span class="servo-val" id="val-shoulder">2047</span>
+      </div>
+      <div class="servo-item">
+        <span class="servo-label">Elbow (ID 4)</span>
+        <div class="servo-bar-wrap"><div class="servo-bar-fill" id="bar-elbow" style="width:50%"></div></div>
+        <span class="servo-val" id="val-elbow">2047</span>
+      </div>
+    </div>
+    <div style="font-size:10px;color:var(--text-dim);font-family:var(--mono)">
+      Left Y → gripper &nbsp;|&nbsp; Right Y → wrist &nbsp;|&nbsp; LB/RB → shoulder &nbsp;|&nbsp; LT/RT → elbow &nbsp;|&nbsp; range 0–4095
+    </div>
+  </div>
+
   <!-- Footer -->
   <div class="footer">
-    <span class="footer-left">Smart Adaptive Gripper &mdash; Arduino Mega 2560 / MPU-6050 / MG90S Servo</span>
+    <span class="footer-left">Smart Adaptive Gripper &mdash; Arduino Mega 2560 / MPU-6050 / HC-SR04</span>
     <span class="footer-right" id="footer-ts">—</span>
   </div>
 
@@ -569,15 +660,6 @@ function addSlipAnnotation(labelIndex) {
   };
 }
 
-function updateServoArc(angle) {
-  const arc = document.getElementById('servo-arc');
-  const r = 22;
-  const circ = 2 * Math.PI * r;       // ~138.23
-  const maxAngle = 175;
-  const dashLen = (angle / maxAngle) * circ;
-  arc.setAttribute('stroke-dasharray', dashLen.toFixed(2) + ' ' + circ.toFixed(2));
-}
-
 function stdDev(arr) {
   if (arr.length < 2) return null;
   const mean = arr.reduce((a,b) => a+b, 0) / arr.length;
@@ -623,8 +705,6 @@ async function fetchAndRender() {
         row.distance < 400 ? row.distance.toFixed(1) : '—';
       document.getElementById('stat-dist-unit').textContent =
         row.distance < 400 ? ' cm' : '';
-      document.getElementById('stat-touch').textContent =
-        'Touch: ' + (row.touch ? 'ACTIVE' : 'none');
 
       const sd = stdDev(axHistory);
       if (sd !== null) {
@@ -640,7 +720,7 @@ async function fetchAndRender() {
 
         addSlipAnnotation(labelIdx);
 
-        const msg = 'Warning. Grip instability detected. Servo tightened.';
+        const msg = 'Warning. Grip instability detected.';
         showBanner(msg);
 
         const log = document.getElementById('slip-log');
@@ -660,19 +740,46 @@ async function fetchAndRender() {
   } catch (_) {}
 }
 
-async function fetchStatus() {
+setInterval(fetchAndRender, 300);
+fetchAndRender();
+
+async function fetchServoStatus() {
   try {
-    const res  = await fetch('/status');
+    const res  = await fetch('/servo_status');
     const data = await res.json();
-    document.getElementById('stat-servo').textContent = data.servo_angle;
-    updateServoArc(data.servo_angle);
+
+    const servoBadge   = document.getElementById('servo-badge');
+    const gamepadBadge = document.getElementById('gamepad-badge');
+
+    if (data.servo_connected) {
+      servoBadge.textContent = 'SERVO LIVE';
+      servoBadge.className   = 'servo-status-badge ok';
+    } else {
+      servoBadge.textContent = 'SERVO OFF';
+      servoBadge.className   = 'servo-status-badge off';
+    }
+
+    if (data.gamepad_detected) {
+      gamepadBadge.textContent = 'GAMEPAD ON';
+      gamepadBadge.className   = 'gamepad-badge ok';
+    } else {
+      gamepadBadge.textContent = 'GAMEPAD OFF';
+      gamepadBadge.className   = 'gamepad-badge off';
+    }
+
+    const pos = data.positions;
+    const keys = ['gripper', 'wrist', 'shoulder', 'elbow'];
+    keys.forEach(k => {
+      const v = pos[k];
+      const pct = ((v / 4095) * 100).toFixed(1);
+      document.getElementById('bar-' + k).style.width = pct + '%';
+      document.getElementById('val-' + k).textContent = v;
+    });
   } catch (_) {}
 }
 
-setInterval(fetchAndRender, 300);
-setInterval(fetchStatus,    500);
-fetchAndRender();
-fetchStatus();
+setInterval(fetchServoStatus, 200);
+fetchServoStatus();
 </script>
 </body>
 </html>
@@ -690,10 +797,7 @@ def analysis():
 
 @app.route("/status")
 def status():
-    return jsonify({
-        "servo_angle": detector.get_servo_angle(),
-        "slip_count":  detector.get_slip_count(),
-    })
+    return jsonify({"slip_count": detector.get_slip_count()})
 
 
 @app.route("/data")
@@ -701,6 +805,17 @@ def data():
     since = float(request.args.get("since", 0))
     rows  = [r for r in detector.get_latest() if r["timestamp"] > since]
     return jsonify(rows)
+
+
+@app.route("/servo_status")
+def servo_status():
+    if gamepad_ctrl is None:
+        return jsonify({
+            "servo_connected": False,
+            "gamepad_detected": False,
+            "positions": {"gripper": 2047, "wrist": 2047, "shoulder": 2047, "elbow": 2047},
+        })
+    return jsonify(gamepad_ctrl.get_status())
 
 
 class DemoDetector:
@@ -711,14 +826,13 @@ class DemoDetector:
     MAX_ROWS      = 200
 
     def __init__(self):
-        self._lock         = threading.Lock()
-        self._data         = collections.deque(maxlen=self.MAX_ROWS)
-        self._analysis     = ""
-        self._servo_angle  = 90
-        self._slip_count   = 0
-        self._running      = False
-        self._t            = 0.0   # phase tracker for smooth waveforms
-        self._last_slip    = 0.0
+        self._lock        = threading.Lock()
+        self._data        = collections.deque(maxlen=self.MAX_ROWS)
+        self._analysis    = ""
+        self._slip_count  = 0
+        self._running     = False
+        self._t           = 0.0   # phase tracker for smooth waveforms
+        self._last_slip   = 0.0
 
     def start(self):
         self._running   = True
@@ -736,22 +850,9 @@ class DemoDetector:
         with self._lock:
             return self._analysis
 
-    def get_servo_angle(self):
-        with self._lock:
-            return self._servo_angle
-
     def get_slip_count(self):
         with self._lock:
             return self._slip_count
-
-    def send_command(self, cmd: str) -> None:
-        with self._lock:
-            if cmd == 'O':
-                self._servo_angle = 0
-                print(f"[DEMO] Command 'O' → OPEN  (servo 0°)")
-            elif cmd == 'G':
-                self._servo_angle = 90
-                print(f"[DEMO] Command 'G' → GRIP  (servo 90°)")
 
     # ── Internal ──────────────────────────────────────────────
 
@@ -771,23 +872,19 @@ class DemoDetector:
                   + random.gauss(0, 0.01))
             distance = (15.0 + 3.0 * math.sin(self._t * 0.4)
                         + random.gauss(0, 0.3))
-            touch = 1
 
             if slip:
                 # Spike ax to simulate a jolt
                 ax += random.choice([-1, 1]) * random.uniform(0.45, 0.75)
                 with self._lock:
-                    self._servo_angle = min(self._servo_angle + 5, 175)
                     self._slip_count += 1
                     count = self._slip_count
-                    angle = self._servo_angle
                 self._analysis = (
                     f"Warning. Grip instability detected. "
-                    f"Acceleration spike of {abs(ax):.2f} g. "
-                    f"Servo tightened."
+                    f"Acceleration spike of {abs(ax):.2f} g."
                 )
                 self._last_slip = now
-                print(f"[DEMO] Slip #{count}  ax={ax:.3f}g  servo={angle}°")
+                print(f"[DEMO] Slip #{count}  ax={ax:.3f}g")
 
             row = {
                 "timestamp": now,
@@ -795,7 +892,6 @@ class DemoDetector:
                 "ay": round(ay, 4),
                 "az": round(az, 4),
                 "distance": round(distance, 2),
-                "touch": touch,
                 "slip": slip,
             }
             with self._lock:
@@ -804,47 +900,14 @@ class DemoDetector:
             time.sleep(self.RATE)
 
 
-def _gamepad_thread(det) -> None:
-    """Read USB gamepad events and route O/G commands through the detector."""
-    try:
-        import inputs as _inputs
-    except ImportError:
-        print("[gamepad] 'inputs' package not installed — skipping controller support")
-        print("[gamepad] Run: pip install inputs")
-        return
-
-    gamepads = _inputs.devices.gamepads
-    if not gamepads:
-        print("[gamepad] No gamepad detected — controller support disabled")
-        print("[gamepad] Check USB connection and try again")
-        return
-
-    gamepad = gamepads[0]
-    print(f"[gamepad] Connected: {gamepad.name}")
-    print(f"[gamepad] X button → Open (0°)   Circle button → Grip (90°)")
-
-    while True:
-        try:
-            for event in gamepad.read():
-                if event.ev_type != "Key" or event.state != 1:
-                    continue
-                if event.code == "BTN_SOUTH":    # X button
-                    print(f"[gamepad] X → OPEN")
-                    det.send_command("O")
-                elif event.code == "BTN_EAST":   # Circle button
-                    print(f"[gamepad] Circle → GRIP")
-                    det.send_command("G")
-        except Exception as e:
-            print(f"[gamepad] Error: {e} — retrying in 2 s")
-            time.sleep(2)
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Gripper live dashboard")
     parser.add_argument("--port", default="/dev/cu.usbmodem21201",
                         help="Serial port (default: %(default)s)")
     parser.add_argument("--demo", action="store_true",
                         help="Run with simulated data — no Arduino required")
+    parser.add_argument("--no-arm", action="store_true",
+                        help="Skip arm servo controller (no Waveshare board)")
     args = parser.parse_args()
 
     if args.demo:
@@ -856,7 +919,12 @@ if __name__ == "__main__":
         detector.start()
         print(f"Slip detector running on {args.port}")
 
-    threading.Thread(target=_gamepad_thread, args=(detector,), daemon=True).start()
+    if not args.no_arm:
+        gamepad_ctrl = GamepadController()
+        gamepad_ctrl.start()
+        print("Gamepad controller started — arm servos on /dev/cu.usbmodem5A7C1172351")
+    else:
+        print("Arm controller skipped (--no-arm)")
 
     print(f"Dashboard → http://localhost:{FLASK_PORT}\n")
     app.run(host=FLASK_HOST, port=FLASK_PORT, debug=False)

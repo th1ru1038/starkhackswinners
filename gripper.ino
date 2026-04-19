@@ -1,30 +1,16 @@
 // gripper.ino — Smart Adaptive Gripper
 // Arduino Mega 2560
-// Streams CSV over Serial: ax,ay,az,distance,touch
-// Receives 'T' to tighten, 'O' to open, 'G' to grip
+// Hardware: MPU-6050 (SDA pin 20, SCL pin 21), HC-SR04 (Trig 9, Echo 10)
+// Streams CSV over Serial at 115200 baud: ax,ay,az,distance
 
 #include <Wire.h>
-#include <Servo.h>
 
 // ── Pin assignments ───────────────────────────────────────────
 #define TRIG_PIN   9    // HC-SR04 trigger
 #define ECHO_PIN   10   // HC-SR04 echo
-#define TOUCH_PIN  7    // TTP223 capacitive touch
-#define SERVO_PIN  6    // MG90S servo signal
-
-// ── Tunable constants ─────────────────────────────────────────
-#define GRIP_DISTANCE_CM  20    // close gripper when object closer than this
-#define TIGHTEN_DEGREES   5     // degrees added per slip command
-#define SERVO_OPEN        0     // fully open angle
-#define SERVO_GRIP        90    // initial grip angle
-#define SERVO_MAX         175   // safety ceiling
 
 // ── MPU-6050 ──────────────────────────────────────────────────
-#define MPU_ADDR  0x68          // I2C address (AD0 pin low)
-
-Servo gripper;
-int   servoAngle = SERVO_OPEN;
-bool  gripping   = false;
+#define MPU_ADDR  0x68  // I2C address (AD0 pin low)
 
 // ─────────────────────────────────────────────────────────────
 void setup() {
@@ -39,32 +25,22 @@ void setup() {
 
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
-  pinMode(TOUCH_PIN, INPUT);
-
-  gripper.attach(SERVO_PIN);
-  gripper.write(servoAngle);
 
   delay(200);  // let sensors stabilise
 }
 
 // ─────────────────────────────────────────────────────────────
 void loop() {
-  checkSerialCommands();
-
   float ax, ay, az;
   readMPU(ax, ay, az);
 
   float distance = readDistance();
-  int   touch    = digitalRead(TOUCH_PIN);
 
-  updateGripLogic(distance, touch);
-
-  // CSV output: ax,ay,az,distance,touch
-  Serial.print(ax, 3);      Serial.print(",");
-  Serial.print(ay, 3);      Serial.print(",");
-  Serial.print(az, 3);      Serial.print(",");
-  Serial.print(distance, 2); Serial.print(",");
-  Serial.println(touch);
+  // CSV output: ax,ay,az,distance
+  Serial.print(ax, 3);       Serial.print(",");
+  Serial.print(ay, 3);       Serial.print(",");
+  Serial.print(az, 3);       Serial.print(",");
+  Serial.println(distance, 2);
 
   delay(50);  // ~20 Hz
 }
@@ -98,39 +74,4 @@ float readDistance() {
   long duration = pulseIn(ECHO_PIN, HIGH, 30000);
   if (duration == 0) return 999.0;
   return duration * 0.0343 / 2.0;
-}
-
-// ── Auto open/close logic ─────────────────────────────────────
-void updateGripLogic(float distance, int touch) {
-  if (!gripping && distance < GRIP_DISTANCE_CM) {
-    servoAngle = SERVO_GRIP;
-    gripper.write(servoAngle);
-    gripping = true;
-  } else if (gripping && distance >= GRIP_DISTANCE_CM && touch == 0) {
-    servoAngle = SERVO_OPEN;
-    gripper.write(servoAngle);
-    gripping = false;
-  }
-}
-
-// ── Handle serial commands from Python ───────────────────────
-// T — tighten (+5°, max SERVO_MAX)
-// O — open    (0°,  gripping = false)
-// G — grip    (90°, gripping = true)
-void checkSerialCommands() {
-  while (Serial.available()) {
-    char cmd = Serial.read();
-    if (cmd == 'T') {
-      servoAngle = min(servoAngle + TIGHTEN_DEGREES, SERVO_MAX);
-      gripper.write(servoAngle);
-    } else if (cmd == 'O') {
-      servoAngle = SERVO_OPEN;
-      gripper.write(servoAngle);
-      gripping = false;
-    } else if (cmd == 'G') {
-      servoAngle = SERVO_GRIP;
-      gripper.write(servoAngle);
-      gripping = true;
-    }
-  }
 }

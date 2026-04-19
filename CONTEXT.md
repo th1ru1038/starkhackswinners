@@ -1,6 +1,6 @@
-# Smart Adaptive Gripper — Project Context
+# STARVIS — Smart Adaptive Gripper | Ford Hackathon
 
-Ford Hackathon project. An Arduino-controlled robotic gripper that autonomously detects when it is losing grip (slip) using an IMU, tightens itself, speaks a voice warning, and streams live sensor data to a web dashboard.
+Real-time grip slip detection on a robot arm. MPU-6050 detects instability, dashboard fires a red banner, Mac speaks a voice alert. Controller moves all 6 arm joints via button-only gamepad input.
 
 ---
 
@@ -11,8 +11,20 @@ Ford Hackathon project. An Arduino-controlled robotic gripper that autonomously 
 | Microcontroller | Arduino Mega 2560 | USB → `/dev/cu.usbmodem21201` |
 | IMU | MPU-6050 | I2C — SDA pin 20, SCL pin 21 |
 | Distance sensor | HC-SR04 ultrasonic | Trig pin 9, Echo pin 10 |
-| Touch sensor | TTP223 capacitive | Pin 7 |
-| Servo | MG90S | Pin 6 |
+| Servo controller | Waveshare Bus Servo Adapter (A) | USB → `/dev/cu.usbmodem5A7C1172351` |
+| Power | 12V 5A external supply | Powers Waveshare board |
+| Controller | ShanWan Q34B gamepad | USB wired |
+
+**No breadboard — direct wire connections. No MG90S servo. No buck converter.**
+
+---
+
+## Serial Ports
+
+| Port | Device | Purpose |
+|------|--------|---------|
+| `/dev/cu.usbmodem21201` | Arduino Mega | IMU + distance sensor data stream |
+| `/dev/cu.usbmodem5A7C1172351` | Waveshare Bus Servo Adapter (A) | Robot arm servo control |
 
 ---
 
@@ -23,51 +35,146 @@ Arduino sketch. Runs on the Mega 2560.
 
 - Reads MPU-6050 accelerometer via direct I2C register reads (no library)
 - Reads HC-SR04 distance via `pulseIn()`
-- Reads TTP223 touch via `digitalRead()`
-- Auto-grip logic: closes servo to 90° when object within `GRIP_DISTANCE_CM`; reopens when object gone and touch is 0
-- Listens for `'T'` over Serial → tightens servo by `TIGHTEN_DEGREES` (max `SERVO_MAX`)
-- Streams CSV at ~20 Hz over Serial at 115200 baud: `ax,ay,az,distance,touch`
-- Libraries used: `Wire.h`, `Servo.h` (both built-in, no install needed)
+- Streams CSV at ~20 Hz over Serial at 115200 baud: `ax,ay,az,distance`
+- No serial commands received — Arduino is read-only
+- Libraries used: `Wire.h` (built-in)
 
 ### `slip_detection.py`
-Core Python module. Can run standalone or be imported by `dashboard.py`.
+Core Python module. Imported by `dashboard.py`, also runnable standalone.
 
-- Opens serial port, parses CSV from Arduino at 115200 baud
-- Maintains a rolling time window of ax values (`SLIP_WINDOW_MS`)
-- Computes population std dev of ax within the window every reading
-- Slip detected when std dev > `SLIP_THRESHOLD_G` AND cooldown has elapsed
-- On slip: sends `'T\n'` to Arduino, fires background thread for speech
-- Speech: builds message with real ax_std value → POST to ElevenLabs API → plays MP3 via `afplay`
-- CSV logging: every 1 second for normal data, immediately on every slip
-- Stores last `MAX_STORED_ROWS` rows in memory for dashboard polling
-- All pipeline steps print timestamped trace logs to terminal
+- Opens Arduino serial port, parses 4-field CSV at 115200 baud
+- Maintains a 500 ms rolling window of ax values
+- Slip detected when ax std dev > `SLIP_THRESHOLD_G` (0.3g) AND cooldown elapsed
+- On slip: fires background thread for macOS `say` voice alert, logs to CSV
+- Stores last 200 rows in memory for dashboard polling
+- CSV log: `timestamp, ax, ay, az, distance, slip`
 
 ### `dashboard.py`
 Flask web app at `http://localhost:5000`.
 
 - Imports `SlipDetector` from `slip_detection.py`, runs it in a background thread
-- `/` — serves inline HTML page with Chart.js live graphs
-- `/data?since=<epoch>` — returns JSON of rows newer than timestamp
-- `/analysis` — returns latest ElevenLabs speech text (polled by JS after slip)
-- Live charts: Acceleration (ax, ay, az) and Distance, each updating every 300 ms
-- Red SLIP DETECTED banner appears on slip, shows the spoken message, auto-hides after 12 s
-- Slip log panel records every event with timestamp
+- Imports `GamepadController` from `gamepad_controller.py`, starts it on launch
+- `--no-arm` flag skips servo controller (no Waveshare board needed)
+- Dark-theme professional UI built for Ford hackathon demo
+- **`--demo` flag**: synthetic sensor data, slip fires every 10 s, no Arduino needed
+- `/` — serves dashboard HTML
+- `/data?since=<epoch>` — returns JSON rows newer than timestamp
+- `/analysis` — returns latest slip alert text
+- `/status` — returns slip count
+- `/servo_status` — returns servo positions and connection state
+- Acceleration chart with red dashed vertical lines at each slip event
+- Distance chart, slip event log, stat cards (slip count, ax std dev, distance)
+- Full-width red flashing SLIP DETECTED banner, 5-second countdown, auto-hides
+- `DemoDetector` class mirrors `SlipDetector` public API for UI testing
+
+### `gamepad_controller.py`
+Threaded arm controller. Imported by `dashboard.py`, also usable standalone.
+
+- Opens Waveshare servo port at 1,000,000 baud using `scservo_sdk`
+- On startup: **reads** current positions of all 6 servos — writes nothing
+- `pygame` polls gamepad at 20 Hz; `inputs` library is NOT used (no macOS joystick support)
+- **Button-only control** — no joystick axis input at all
+- D-pad and face buttons each control exactly one servo; no crossover
+- LT/RT are analog axes thresholded at `> 0.5` (strict greater-than prevents false trigger on pygame init)
+- Position limits: 500–3500 global; gripper: 1000–3000
+- `STEP = 30` units per tick; servo moves while button held, stops on release
+- Logs each servo move to stdout: `[SERVO] ID 3 (elbow): 2949 → 2979`
+- ID 2 (shoulder) is excluded from all write paths — read-only at startup
+- `DEBUG_GAMEPAD = True` prints all raw button/hat/axis values for remapping
+
+### `scan_servos.py`
+One-shot scan script. Not part of live system.
+
+- Probes servo IDs 1–10 on the Waveshare port and prints which respond with their current positions
+- Used to discover servo IDs when arm was expanded from 4 to 6 servos
 
 ### `gripper_log.csv`
-Auto-generated data log. Created in the working directory on first run.
+Auto-generated. Created on first run.
+Columns: `timestamp, ax, ay, az, distance, slip`
 
-- Columns: `timestamp, ax, ay, az, distance, touch, slip`
-- Normal rows: written at most once per second
-- Slip rows: written immediately regardless of the 1-second throttle
+### `test_voice.py`
+Standalone ElevenLabs voice test. Sends a hardcoded message and plays via `afplay`.
+Uses `eleven_flash_v2_5` model. Not part of the live system.
 
 ### `.env`
-API credentials. Never commit this file.
+API credentials. Never committed.
+```
+ELEVENLABS_API_KEY=...   # used only by test_voice.py
+```
 
-```
-GEMINI_API_KEY=...           # unused currently (Gemini removed)
-ELEVENLABS_API_KEY=...       # required for voice alerts
-ELEVENLABS_VOICE_ID=...      # optional, defaults to Rachel
-```
+---
+
+## Servo IDs (confirmed by physical testing 2026-04-19)
+
+| Servo ID | Position at scan | Joint | Status |
+|----------|-----------------|-------|--------|
+| 1 | 966 | Gripper | Active — not physically responding yet |
+| 2 | 1786 | Shoulder | **LOCKED — never commanded, forever** |
+| 3 | 2949 | Elbow | Working (LT/RT confirmed) |
+| 4 | 1864 | Base rotation | Working (D-pad LEFT/RIGHT confirmed) |
+| 5 | 1000 | Forearm up/down | Active — not physically responding yet |
+| 6 | 1578 | Wrist clockwise/anticlockwise | Working (X/B confirmed) |
+
+IDs confirmed by physical testing. IDs 7–10 did not respond to `scan_servos.py`.
+ID 2 (shoulder) is permanently locked — do not send any write commands to it.
+
+---
+
+## Gamepad Button Mappings (button-only — no joystick axis input)
+
+Controller: ShanWan Q34B (detected by pygame as "Nintendo Switch Pro Controller", 6 axes, 20 buttons)
+
+| Input | pygame index | Servo ID | Joint | Direction |
+|-------|-------------|----------|-------|-----------|
+| D-pad UP | hat(0) y=+1 | 1 | Gripper | close |
+| D-pad DOWN | hat(0) y=−1 | 1 | Gripper | open |
+| D-pad LEFT | hat(0) x=−1 | 4 | Base | left |
+| D-pad RIGHT | hat(0) x=+1 | 4 | Base | right |
+| LB button | btn 4 | 4 | Base | left (alternate) |
+| RB button | btn 5 | 4 | Base | right (alternate) |
+| Y button | btn 2 | 5 | Forearm | up |
+| A button | btn 1 | 5 | Forearm | down |
+| X button | btn 3 | 6 | Wrist | clockwise |
+| B button | btn 0 | 6 | Wrist | counter-clockwise |
+| RT (axis 5 > 0.5) | axis 5 | 3 | Elbow | up |
+| LT (axis 4 > 0.5) | axis 4 | 3 | Elbow | down |
+| — | — | 2 | Shoulder | **LOCKED — never commanded** |
+
+Step size: 30 units/tick at 20 Hz. Servo moves while held, stops immediately on release.
+Input library: `pygame` — `inputs` library has no macOS joystick support and must not be used.
+
+**If a button does the wrong thing:** set `DEBUG_GAMEPAD = True` at the top of `gamepad_controller.py`. It prints `btns=` / `hats=` / `axes=` on every active event. Note the index that lights up and update the corresponding `BTN_*` constant.
+
+---
+
+## Known Bugs Fixed
+
+### Arm moves on startup (2026-04-19)
+**Symptom:** Elbow moves as soon as dashboard launches, before any button is pressed.
+**Cause:** pygame initializes analog trigger axes to `0.0` before the first hardware HID event. After remap `(0.0 + 1.0) / 2 = 0.5`. The old threshold check was `>= 0.5`, so both `lt_held` and `rt_held` were `True` on the very first servo tick.
+**Fix:** Changed threshold check to `> TRIGGER_THRESHOLD` (strict greater-than). The startup default of exactly `0.5` no longer registers as a press. Hardware resting value after the first real event is `0.0`, well below the threshold.
+
+---
+
+## Current Issues
+
+### Gripper (ID 1) not physically responding
+Servo responds to scan (position 966) but does not move when D-pad UP/DOWN is pressed. Electrical or mechanical issue — servo communication appears OK.
+
+### Forearm (ID 5) not physically responding
+Servo responds to scan (position 1000) but does not move when Y/A is pressed. Same class of issue as gripper.
+
+### Previous "wrist ID 2" issue — resolved by remapping
+ID 2 is physically the shoulder joint (locked). The earlier non-response was because we were sending commands to the wrong servo. Wrist is ID 6, now correctly mapped to X/B.
+
+---
+
+## Demo Flow
+
+1. Press D-pad UP → gripper closes, grabs object
+2. Shake arm → MPU-6050 ax std dev spikes above 0.3g
+3. Slip detected → Mac speaks "Warning. Grip instability detected. Acceleration spike of X g."
+4. Dashboard fires red flashing banner, logs event, marks red line on acceleration chart
 
 ---
 
@@ -75,73 +182,80 @@ ELEVENLABS_VOICE_ID=...      # optional, defaults to Rachel
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| IMU streaming over Serial | Working | ~20 Hz, CSV format |
+| IMU streaming over Serial | Working | ~20 Hz, 4-field CSV |
 | Ultrasonic distance | Working | 30 ms timeout for out-of-range |
-| Capacitive touch | Working | Digital read on pin 7 |
-| Auto-grip on proximity | Working | Triggers at 20 cm |
 | Slip detection (rolling std dev) | Working | 500 ms window, 0.3g threshold |
-| Servo tighten on slip | Working | +5° per slip command, max 175° |
 | Slip cooldown | Working | 2 s between events |
 | CSV logging (throttled) | Working | 1 Hz normal, immediate on slip |
-| ElevenLabs voice alert | Working | Speaks ax_std value aloud |
+| macOS voice alert | Working | `say` command, non-blocking thread |
 | Flask live dashboard | Working | Polls at 300 ms |
-| Live acceleration chart | Working | ax, ay, az last 80 points |
-| Live distance chart | Working | Last 80 points |
-| Red slip banner | Working | Shows spoken message, hides after 12 s |
-| Slip event log panel | Working | Timestamped list in dashboard |
+| Slip banner (flashing red) | Working | 5 s countdown, auto-hides |
+| Acceleration chart + slip markers | Working | Red dashed vertical lines |
+| Distance chart | Working | Last 100 points |
+| Slip event log panel | Working | Timestamped list |
+| Demo mode (`--demo`) | Working | No Arduino needed |
+| SCServo arm control | Working | `scservo_sdk` via PyPI, all 6 IDs scanned and confirmed |
+| Button-only gamepad control | Working | pygame backend; D-pad, face buttons, LT/RT |
+| Startup motion bug | Fixed | Trigger `>=` → `>` threshold; no writes before first button press |
+| Servo ID remapping | Fixed | Physical testing confirmed correct IDs; shoulder (ID 2) permanently locked |
+| Elbow (ID 3) LT/RT | Working | Confirmed physically |
+| Base (ID 4) D-pad LEFT/RIGHT | Working | Confirmed physically |
+| Wrist (ID 6) X/B | Working | Confirmed physically |
+| Gripper (ID 1) D-pad UP/DOWN | **Not responding** | Electrical/mechanical — servo scans OK |
+| Forearm (ID 5) Y/A | **Not responding** | Electrical/mechanical — servo scans OK |
 
 ---
 
-## Tunable Constants
-
-### `gripper.ino`
+## Tunable Constants (`gamepad_controller.py`)
 
 | Constant | Value | Effect |
 |----------|-------|--------|
-| `GRIP_DISTANCE_CM` | 20 | Object must be closer than this (cm) to trigger grip |
-| `TIGHTEN_DEGREES` | 5 | Degrees added to servo angle on each `'T'` command |
-| `SERVO_OPEN` | 0° | Resting/open position |
-| `SERVO_GRIP` | 90° | Initial grip angle when object detected |
-| `SERVO_MAX` | 175° | Hard ceiling — servo never exceeds this |
+| `STEP` | 30 | Position units per tick per button press |
+| `SERVO_SPEED` | 1000 | Servo travel speed (0–32767) |
+| `LOOP_HZ` | 20 | Control loop frequency |
+| `TRIGGER_THRESHOLD` | 0.5 | LT/RT axis value (0–1) above which trigger counts as held |
+| `POSITION_MIN` | 500 | Global lower clamp for all servos |
+| `POSITION_MAX` | 3500 | Global upper clamp for all servos |
+| `GRIPPER_MIN` | 1000 | Gripper-specific lower clamp |
+| `GRIPPER_MAX` | 3000 | Gripper-specific upper clamp |
+| `DEBUG_GAMEPAD` | False | Set True to print all raw button/hat/axis events |
 
-### `slip_detection.py`
+---
+
+## Tunable Constants (`slip_detection.py`)
 
 | Constant | Value | Effect |
 |----------|-------|--------|
 | `SERIAL_PORT` | `/dev/cu.usbmodem21201` | Arduino serial port |
 | `SERIAL_BAUD` | 115200 | Must match `Serial.begin()` in Arduino |
-| `SLIP_WINDOW_MS` | 500 | Rolling window length for std dev calculation |
-| `SLIP_THRESHOLD_G` | 0.3 | ax std dev above this triggers slip (lower = more sensitive) |
-| `SLIP_COOLDOWN_S` | 2.0 | Minimum seconds between consecutive slip events |
-| `MAX_STORED_ROWS` | 200 | How many rows kept in memory for dashboard |
+| `SLIP_WINDOW_MS` | 500 | Rolling window length for std dev |
+| `SLIP_THRESHOLD_G` | 0.3 | ax std dev above this triggers slip |
+| `SLIP_COOLDOWN_S` | 2.0 | Minimum seconds between slip events |
+| `MAX_STORED_ROWS` | 200 | Rows kept in memory for dashboard |
 | `LOG_FILE` | `gripper_log.csv` | Output CSV filename |
-| `ELEVENLABS_VOICE` | Rachel (`21m00Tcm4TlvDq8ikWAM`) | Override via `ELEVENLABS_VOICE_ID` in `.env` |
-
-### `dashboard.py`
-
-| Constant | Value | Effect |
-|----------|-------|--------|
-| `FLASK_HOST` | `127.0.0.1` | Change to `0.0.0.0` to expose on local network |
-| `FLASK_PORT` | 5000 | Dashboard URL port |
 
 ---
 
 ## How to Run
 
 ```bash
-# 1. Install dependencies
-pip install flask pyserial python-dotenv requests
+# Install dependencies
+pip install flask pyserial python-dotenv pygame scservo_sdk
 
-# 2. Fill in .env
-echo "ELEVENLABS_API_KEY=your_key_here" >> .env
+# Run dashboard (starts slip detector + arm controller)
+python3 dashboard.py
 
-# 3. Upload gripper.ino via Arduino IDE (Board: Mega 2560)
+# Run in demo mode (no Arduino needed)
+python3 dashboard.py --demo
 
-# 4. Run dashboard (starts everything)
-python dashboard.py
+# Skip arm controller (no Waveshare board)
+python3 dashboard.py --no-arm
 
-# — or — run slip detector alone (no browser)
-python slip_detection.py
+# Run slip detector alone
+python3 slip_detection.py
+
+# Scan servo IDs (run once to discover IDs)
+python3 scan_servos.py
 ```
 
 Open `http://localhost:5000` in a browser.
@@ -152,11 +266,6 @@ Open `http://localhost:5000` in a browser.
 
 Arduino → Python, CSV, ~20 Hz:
 ```
-ax,ay,az,distance,touch
--0.02,0.01,1.00,14.32,1
-```
-
-Python → Arduino, on slip:
-```
-T\n
+ax,ay,az,distance
+-0.02,0.01,1.00,14.32
 ```
